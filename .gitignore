@@ -1,0 +1,13 @@
+/HentaiAtHome_1.6.4_src
+.gocache/
+.gomodcache/
+.javabuild/
+dist/
+client.exe
+*.exe
+data/
+log/
+cache/
+download/
+tmp/
+certs/
