@@ -168,7 +168,10 @@ install_binary() {
 
   echo "Installing bundled binary from $bundled_binary to $bin_path"
   if [[ "$(cd "$(dirname "$bundled_binary")" && pwd)/$(basename "$bundled_binary")" != "$(cd "$(dirname "$bin_path")" && pwd)/$(basename "$bin_path")" ]]; then
-    cp "$bundled_binary" "$bin_path"
+    local temp_target="$bin_path.new.$$"
+    cp "$bundled_binary" "$temp_target"
+    chmod +x "$temp_target" 2>/dev/null || true
+    mv -f "$temp_target" "$bin_path"
   fi
   chmod +x "$bin_path" 2>/dev/null || true
 }
