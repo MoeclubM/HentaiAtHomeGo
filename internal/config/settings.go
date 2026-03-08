@@ -311,6 +311,14 @@ func (s *Settings) ParseArgs(args []string) bool {
 		return false
 	}
 
+	allowedArgs := map[string]bool{
+		"data_dir":     true,
+		"log_dir":      true,
+		"cache_dir":    true,
+		"temp_dir":     true,
+		"download_dir": true,
+	}
+
 	for _, arg := range args {
 		if arg == "" {
 			continue
@@ -324,10 +332,18 @@ func (s *Settings) ParseArgs(args []string) bool {
 		arg = arg[2:] // 移除 --
 
 		parts := strings.SplitN(arg, "=", 2)
+		key := strings.ReplaceAll(parts[0], "-", "_")
+		key = strings.ToLower(key)
+
+		if !allowedArgs[key] {
+			util.Warning("忽略本地参数 %s，运行参数应由管理端下发", parts[0])
+			continue
+		}
+
 		if len(parts) == 2 {
-			s.updateSetting(parts[0], parts[1])
+			s.updateSetting(key, parts[1])
 		} else {
-			s.updateSetting(parts[0], "true")
+			s.updateSetting(key, "true")
 		}
 	}
 

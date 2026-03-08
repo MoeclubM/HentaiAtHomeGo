@@ -86,8 +86,9 @@ jobs:
             go build -trimpath -ldflags="-s -w" -o "$PACKAGE_DIR/$BINARY" ./cmd/client
 
           cp README.md LICENSE "$PACKAGE_DIR/"
-          cp scripts/install.sh scripts/install.ps1 "$PACKAGE_DIR/"
+          cp scripts/install.sh scripts/install.ps1 scripts/bootstrap-install.sh "$PACKAGE_DIR/"
           chmod +x "$PACKAGE_DIR/install.sh"
+          chmod +x "$PACKAGE_DIR/bootstrap-install.sh"
 
           if [ "${{ matrix.archive }}" = "zip" ]; then
             (
