@@ -1,9 +1,6 @@
-// Package cache 提供缓存管理功能
 package cache
 
 import (
-	"crypto/sha1"
-	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
@@ -19,49 +16,44 @@ import (
 	"github.com/qwq/hentaiathomego/pkg/hvfile"
 )
 
-const (
-	LRU_CACHE_SIZE = 1048576
-)
+const LRU_CACHE_SIZE = 1048576
 
-// CacheHandler 缓存处理器
 type CacheHandler struct {
-	client            Client
-	lruCacheTable     []int16
-	staticRangeOldest map[string]int64
-	cacheCount        int
-	cacheSize         int64
-	lruClearPointer   int
-	lruSkipCheckCycle int
-	pruneAggression   int
+	client               Client
+	lruCacheTable        []int16
+	staticRangeOldest    map[string]int64
+	cacheCount           int
+	cacheSize            int64
+	lruClearPointer      int
+	lruSkipCheckCycle    int
+	pruneAggression      int
 	lastFileVerification int64
-	cacheLoaded       bool
+	cacheLoaded          bool
 }
 
-// Client 客户端接口
 type Client interface {
 	GetServerHandler() *network.ServerHandler
 	IsShuttingDown() bool
 }
 
-// NewCacheHandler 创建新的缓存处理器
 func NewCacheHandler(client Client) (*CacheHandler, error) {
 	settings := config.GetSettings()
 
-	// 清理临时目录中的孤立文件
-	tempDir := settings.GetTempDir()
-	entries, err := os.ReadDir(tempDir)
+	entries, err := os.ReadDir(settings.GetTempDir())
 	if err == nil {
 		for _, entry := range entries {
-			if !entry.IsDir() {
-				name := entry.Name()
-				// 不删除日志和配置文件
-				if !strings.HasPrefix(name, "log_") && !strings.HasPrefix(name, "pcache_") &&
-					name != "client_login" && name != "hathcert.p12" {
-					filePath := filepath.Join(tempDir, name)
-					util.Debug("CacheHandler: 删除孤立的临时文件 %s", filePath)
-					os.Remove(filePath)
-				}
+			if entry.IsDir() {
+				continue
 			}
+
+			name := entry.Name()
+			if strings.HasPrefix(name, "log_") || strings.HasPrefix(name, "pcache_") || name == "client_login" || name == "hathcert.p12" {
+				continue
+			}
+
+			filePath := filepath.Join(settings.GetTempDir(), name)
+			util.Debug("CacheHandler: 删除孤立临时文件 %s", filePath)
+			_ = os.Remove(filePath)
 		}
 	}
 
@@ -69,10 +61,9 @@ func NewCacheHandler(client Client) (*CacheHandler, error) {
 		client:            client,
 		lruCacheTable:     make([]int16, LRU_CACHE_SIZE),
 		staticRangeOldest: make(map[string]int64),
-		cacheLoaded:       false,
+		pruneAggression:   1,
 	}
 
-	// 初始化缓存
 	if err := ch.initializeCache(); err != nil {
 		return nil, err
 	}
@@ -80,103 +71,281 @@ func NewCacheHandler(client Client) (*CacheHandler, error) {
 	return ch, nil
 }
 
-// initializeCache 初始化缓存
 func (ch *CacheHandler) initializeCache() error {
 	settings := config.GetSettings()
-	cacheDir := settings.GetCacheDir()
+	fastStartup := false
 
-	util.Info("CacheHandler: 初始化缓存系统...")
-
-	// 扫描缓存目录计算总文件数和大小
-	err := filepath.Walk(cacheDir, func(path string, info os.FileInfo, err error) error {
+	if !settings.IsRescanCache() {
+		util.Info("CacheHandler: 尝试加载持久化缓存数据...")
+		loaded, err := ch.loadPersistentData()
 		if err != nil {
+			util.Debug("CacheHandler: 持久化缓存加载失败，将回退到全量扫描: %v", err)
+		} else if loaded {
+			util.Info("CacheHandler: 已加载持久化缓存数据")
+			fastStartup = true
+		} else {
+			util.Info("CacheHandler: 持久化缓存数据不可用")
+		}
+	}
+
+	ch.deletePersistentData()
+
+	if !fastStartup {
+		util.Info("CacheHandler: 初始化缓存系统...")
+		if err := ch.startupCacheCleanup(); err != nil {
 			return err
 		}
 
-		if info.IsDir() {
+		if ch.client.IsShuttingDown() {
 			return nil
 		}
 
-		// 解析文件 ID
-		fileID := info.Name()
-		hvFile, err := hvfile.GetHVFileFromFileid(fileID)
-		if err != nil {
-			util.Debug("CacheHandler: 文件 %s 未被识别", path)
-			os.Remove(path)
-			return nil
+		ch.lruClearPointer = 0
+		ch.cacheCount = 0
+		ch.cacheSize = 0
+		ch.staticRangeOldest = make(map[string]int64, max(1, int(float64(settings.GetStaticRangeCount())*1.5)))
+		ch.lruCacheTable = make([]int16, LRU_CACHE_SIZE)
+
+		if err := ch.startupInitCache(); err != nil {
+			return err
 		}
-
-		// 检查是否在静态范围内
-		if !settings.IsStaticRange(hvFile.GetStaticRange()) {
-			util.Debug("CacheHandler: 文件 %s 不在活动静态范围内", path)
-			os.Remove(path)
-			return nil
-		}
-
-		// 检查文件大小
-		if info.Size() != int64(hvFile.GetSize()) {
-			util.Debug("CacheHandler: 文件 %s 已损坏", path)
-			os.Remove(path)
-			return nil
-		}
-
-		ch.addFileToActiveCache(hvFile)
-
-		// 更新静态范围最旧时间
-		staticRange := hvFile.GetStaticRange()
-		if oldest, ok := ch.staticRangeOldest[staticRange]; !ok || info.ModTime().UnixNano() < oldest {
-			ch.staticRangeOldest[staticRange] = info.ModTime().UnixNano()
-		}
-
-		return nil
-	})
-
-	if err != nil {
-		return fmt.Errorf("扫描缓存失败: %w", err)
 	}
 
-	util.Info("CacheHandler: 完成缓存初始化 (%d 文件, %d 字节)", ch.cacheCount, ch.cacheSize)
-	ch.updateStats()
 	ch.cacheLoaded = true
+
+	if !ch.RecheckFreeDiskSpace() {
+		return fmt.Errorf("缓存所在存储设备剩余空间不足，无法满足当前节点运行要求")
+	}
+
+	if ch.cacheCount < 1 && settings.GetStaticRangeCount() > 20 {
+		return fmt.Errorf("当前节点已分配静态范围，但缓存为空；这会严重影响 CDN 信任度，请检查缓存目录或在管理端重置静态范围")
+	}
 
 	return nil
 }
 
-// addFileToActiveCache 添加文件到活动缓存
+func (ch *CacheHandler) startupCacheCleanup() error {
+	settings := config.GetSettings()
+	cacheDir := settings.GetCacheDir()
+
+	util.Info("CacheHandler: 启动缓存清理扫描...")
+	level1Entries, err := os.ReadDir(cacheDir)
+	if err != nil {
+		return fmt.Errorf("无法访问缓存目录 %s: %w", cacheDir, err)
+	}
+
+	if settings.GetStaticRangeCount() > 0 && len(level1Entries) > settings.GetStaticRangeCount() {
+		util.Warning("CacheHandler: 缓存目录下存在 %d 个一级目录，但当前只分配了 %d 个静态范围", len(level1Entries), settings.GetStaticRangeCount())
+	}
+
+	checkedCounter := 0
+	checkedCounterPct := 0
+
+	for _, l1entry := range level1Entries {
+		if ch.client.IsShuttingDown() {
+			return nil
+		}
+
+		l1path := filepath.Join(cacheDir, l1entry.Name())
+		if !l1entry.IsDir() {
+			_ = os.Remove(l1path)
+			continue
+		}
+
+		level2Entries, err := os.ReadDir(l1path)
+		if err != nil {
+			util.Warning("CacheHandler: 无法访问一级缓存目录 %s", l1path)
+			continue
+		}
+
+		if len(level2Entries) == 0 {
+			_ = os.Remove(l1path)
+			continue
+		}
+
+		for _, l2entry := range level2Entries {
+			if l2entry.IsDir() {
+				continue
+			}
+
+			l2path := filepath.Join(l1path, l2entry.Name())
+			hvFile, err := hvfile.GetHVFileFromFile(l2path)
+			if err != nil {
+				util.Debug("CacheHandler: 文件 %s 无法识别，已删除", l2path)
+				_ = os.Remove(l2path)
+				continue
+			}
+
+			if !settings.IsStaticRange(hvFile.GetFileID()) {
+				util.Debug("CacheHandler: 文件 %s 不在当前活动静态范围内，已删除", l2path)
+				_ = os.Remove(l2path)
+				continue
+			}
+
+			if ch.moveFileToCacheDir(l2path, hvFile) {
+				util.Debug("CacheHandler: 已重定位文件 %s 到 %s", hvFile.GetFileID(), hvFile.GetLocalFileRef())
+			}
+		}
+
+		checkedCounter++
+		if len(level1Entries) > 9 {
+			pct := checkedCounter * 100 / len(level1Entries)
+			if pct >= checkedCounterPct+10 {
+				checkedCounterPct += 10
+				util.Info("CacheHandler: 启动清理进度 %d%%", checkedCounterPct)
+			}
+		}
+	}
+
+	util.Info("CacheHandler: 已扫描 %d 个一级缓存目录", checkedCounter)
+	return nil
+}
+
+func (ch *CacheHandler) startupInitCache() error {
+	settings := config.GetSettings()
+	cacheDir := settings.GetCacheDir()
+
+	var validator hvfile.FileValidator
+	printFreq := 10000
+	if settings.IsVerifyCache() {
+		util.Info("CacheHandler: 启动时执行完整缓存校验，这可能持续较长时间")
+		validator = util.NewFileValidator()
+		printFreq = 1000
+	} else {
+		util.Info("CacheHandler: 加载缓存...")
+	}
+
+	recentlyAccessedCutoff := time.Now().Add(-7 * 24 * time.Hour).UnixNano()
+	foundStaticRanges := 0
+
+	level1Entries, err := os.ReadDir(cacheDir)
+	if err != nil {
+		return fmt.Errorf("无法访问缓存目录 %s: %w", cacheDir, err)
+	}
+
+	for _, l1entry := range level1Entries {
+		if ch.client.IsShuttingDown() {
+			return nil
+		}
+
+		if !l1entry.IsDir() {
+			continue
+		}
+
+		l1path := filepath.Join(cacheDir, l1entry.Name())
+		level2Entries, err := os.ReadDir(l1path)
+		if err != nil {
+			continue
+		}
+
+		for _, l2entry := range level2Entries {
+			if !l2entry.IsDir() {
+				continue
+			}
+
+			l2path := filepath.Join(l1path, l2entry.Name())
+			files, err := os.ReadDir(l2path)
+			if err != nil {
+				util.Warning("CacheHandler: 无法访问二级缓存目录 %s", l2path)
+				continue
+			}
+
+			filesInDir := 0
+			oldestLastModified := time.Now().UnixNano()
+
+			for _, entry := range files {
+				if !entry.Type().IsRegular() {
+					continue
+				}
+
+				filesInDir++
+				filePath := filepath.Join(l2path, entry.Name())
+				info, err := entry.Info()
+				if err != nil {
+					_ = os.Remove(filePath)
+					filesInDir--
+					continue
+				}
+
+				var hvFile *hvfile.HVFile
+				if validator != nil {
+					hvFile, err = hvfile.GetHVFileFromFileWithValidator(filePath, validator)
+				} else {
+					hvFile, err = hvfile.GetHVFileFromFile(filePath)
+				}
+
+				if err != nil {
+					util.Debug("CacheHandler: 文件 %s 已损坏，已删除", filePath)
+					_ = os.Remove(filePath)
+					filesInDir--
+					continue
+				}
+
+				if !settings.IsStaticRange(hvFile.GetFileID()) {
+					util.Debug("CacheHandler: 文件 %s 不在活动静态范围内，已删除", filePath)
+					_ = os.Remove(filePath)
+					filesInDir--
+					continue
+				}
+
+				ch.addFileToActiveCache(hvFile)
+				fileLastModified := info.ModTime().UnixNano()
+				if fileLastModified > recentlyAccessedCutoff {
+					ch.markRecentlyAccessed(hvFile, true)
+				}
+				if fileLastModified < oldestLastModified {
+					oldestLastModified = fileLastModified
+				}
+
+				if ch.cacheCount%printFreq == 0 {
+					util.Info("CacheHandler: 已加载 %d 个缓存文件...", ch.cacheCount)
+				}
+			}
+
+			if filesInDir < 1 {
+				_ = os.Remove(l2path)
+				continue
+			}
+
+			staticRange := l1entry.Name() + l2entry.Name()
+			ch.staticRangeOldest[staticRange] = oldestLastModified
+			foundStaticRanges++
+			if foundStaticRanges%100 == 0 {
+				util.Info("CacheHandler: 已发现 %d 个含缓存文件的静态范围...", foundStaticRanges)
+			}
+		}
+	}
+
+	util.Info("CacheHandler: 缓存初始化完成（%d 文件，%d 表观字节，%d 估算磁盘字节）", ch.cacheCount, ch.cacheSize, ch.getCacheSizeWithOverhead())
+	util.Info("CacheHandler: 共发现 %d 个含缓存文件的静态范围", foundStaticRanges)
+	ch.updateStats()
+	return nil
+}
+
 func (ch *CacheHandler) addFileToActiveCache(hvFile *hvfile.HVFile) {
 	ch.cacheCount++
 	ch.cacheSize += int64(hvFile.GetSize())
 }
 
-// updateStats 更新统计
 func (ch *CacheHandler) updateStats() {
-	settings := config.GetSettings()
-	cacheSizeWithOverhead := ch.cacheSize + int64(ch.cacheCount)*settings.GetFileSystemBlockSize()/2
-
 	stats.SetCacheCount(ch.cacheCount)
-	stats.SetCacheSize(cacheSizeWithOverhead)
+	stats.SetCacheSize(ch.getCacheSizeWithOverhead())
 }
 
-// GetCacheCount 获取缓存数量
 func (ch *CacheHandler) GetCacheCount() int {
 	return ch.cacheCount
 }
 
-// MarkRecentlyAccessed 标记最近访问
 func (ch *CacheHandler) MarkRecentlyAccessed(hvFile *hvfile.HVFile) bool {
 	return ch.markRecentlyAccessed(hvFile, false)
 }
 
-// markRecentlyAccessed 标记最近访问（内部）
 func (ch *CacheHandler) markRecentlyAccessed(hvFile *hvfile.HVFile, skipMetaUpdate bool) bool {
 	fileID := hvFile.GetFileID()
-
-	// 位 16-35
 	arrayIndex, _ := strconv.ParseInt(fileID[4:9], 16, 64)
 
-	// 位 36-39 (十六进制字符 0-f)
 	bitChar := fileID[9]
-	var bitValue int
+	bitValue := 0
 	switch {
 	case bitChar >= '0' && bitChar <= '9':
 		bitValue = int(bitChar - '0')
@@ -184,13 +353,10 @@ func (ch *CacheHandler) markRecentlyAccessed(hvFile *hvfile.HVFile, skipMetaUpda
 		bitValue = int(bitChar-'a') + 10
 	case bitChar >= 'A' && bitChar <= 'F':
 		bitValue = int(bitChar-'A') + 10
-	default:
-		bitValue = 0 // 无效字符，使用 0
 	}
 	bitMask := int16(1 << bitValue)
 
 	markFile := true
-
 	if (ch.lruCacheTable[arrayIndex] & bitMask) != 0 {
 		markFile = false
 	} else {
@@ -203,7 +369,8 @@ func (ch *CacheHandler) markRecentlyAccessed(hvFile *hvfile.HVFile, skipMetaUpda
 		if err == nil {
 			oneWeekAgo := time.Now().Add(-7 * 24 * time.Hour)
 			if info.ModTime().Before(oneWeekAgo) {
-				os.Chtimes(filePath, time.Now(), time.Now())
+				now := time.Now()
+				_ = os.Chtimes(filePath, now, now)
 			}
 		}
 	}
@@ -211,51 +378,43 @@ func (ch *CacheHandler) markRecentlyAccessed(hvFile *hvfile.HVFile, skipMetaUpda
 	return markFile
 }
 
-// IsFileVerificationOnCooldown 检查文件验证是否在冷却中
 func (ch *CacheHandler) IsFileVerificationOnCooldown() bool {
 	now := time.Now().UnixMilli()
-
 	if ch.lastFileVerification > 0 && now-ch.lastFileVerification < 2000 {
 		return true
 	}
-
 	ch.lastFileVerification = now
 	return false
 }
 
-// DeleteFileFromCache 从缓存删除文件
 func (ch *CacheHandler) DeleteFileFromCache(hvFile *hvfile.HVFile) {
 	filePath := hvFile.GetLocalFileRef()
-
-	if _, err := os.Stat(filePath); err == nil {
-		if err := os.Remove(filePath); err != nil {
-			util.Error("CacheHandler: 删除缓存文件失败: %v", err)
-			return
-		}
-
-		ch.cacheCount--
-		ch.cacheSize -= int64(hvFile.GetSize())
-		ch.updateStats()
-
-		util.Debug("CacheHandler: 删除缓存文件 %s", hvFile.String())
+	if _, err := os.Stat(filePath); err != nil {
+		return
 	}
+
+	if err := os.Remove(filePath); err != nil {
+		util.Error("CacheHandler: 删除缓存文件失败: %v", err)
+		return
+	}
+
+	ch.cacheCount--
+	ch.cacheSize -= int64(hvFile.GetSize())
+	ch.updateStats()
+	util.Debug("CacheHandler: 删除缓存文件 %s", hvFile.String())
 }
 
-// CycleLRUCacheTable 循环 LRU 缓存表
 func (ch *CacheHandler) CycleLRUCacheTable() {
 	clearUntil := minInt(LRU_CACHE_SIZE, ch.lruClearPointer+17)
-
 	for ch.lruClearPointer < clearUntil {
 		ch.lruCacheTable[ch.lruClearPointer] = 0
 		ch.lruClearPointer++
 	}
-
 	if clearUntil >= LRU_CACHE_SIZE {
 		ch.lruClearPointer = 0
 	}
 }
 
-// RecheckFreeDiskSpace 重新检查磁盘空间
 func (ch *CacheHandler) RecheckFreeDiskSpace() bool {
 	if ch.lruSkipCheckCycle > 0 {
 		ch.lruSkipCheckCycle--
@@ -263,7 +422,7 @@ func (ch *CacheHandler) RecheckFreeDiskSpace() bool {
 	}
 
 	settings := config.GetSettings()
-	wantFree := int64(104857600) // 100MB
+	wantFree := int64(104857600)
 	cacheLimit := settings.GetDiskLimitBytes()
 	cacheSizeWithOverhead := ch.getCacheSizeWithOverhead()
 	bytesToFree := int64(0)
@@ -274,100 +433,136 @@ func (ch *CacheHandler) RecheckFreeDiskSpace() bool {
 		bytesToFree = wantFree - (cacheLimit - cacheSizeWithOverhead)
 	}
 
+	util.Debug("CacheHandler: 检查缓存空间 (cacheSize=%d cacheSizeWithOverhead=%d cacheLimit=%d cacheFree=%d)", ch.cacheSize, cacheSizeWithOverhead, cacheLimit, cacheLimit-cacheSizeWithOverhead)
+
 	if bytesToFree > 0 && ch.cacheCount > 0 && settings.GetStaticRangeCount() > 0 {
-		// 找到最旧的静态范围并删除文件
 		pruneStaticRange := ch.findOldestStaticRange()
 		if pruneStaticRange == "" {
-			util.Warning("CacheHandler: 找不到要修剪的静态范围")
+			util.Warning("CacheHandler: 无法找到要修剪的静态范围")
 			return false
 		}
 
-		// 删除该范围内的旧文件
-		cacheDir := settings.GetCacheDir()
-		staticRangeDir := filepath.Join(cacheDir, pruneStaticRange[0:2], pruneStaticRange[2:4])
+		now := time.Now()
+		oldestRangeAge := time.Unix(0, ch.staticRangeOldest[pruneStaticRange])
+		lruLastModifiedPruneCutoff := oldestRangeAge
 
+		switch {
+		case oldestRangeAge.Before(now.Add(-180 * 24 * time.Hour)):
+			lruLastModifiedPruneCutoff = lruLastModifiedPruneCutoff.Add(30 * 24 * time.Hour)
+		case oldestRangeAge.Before(now.Add(-90 * 24 * time.Hour)):
+			lruLastModifiedPruneCutoff = lruLastModifiedPruneCutoff.Add(7 * 24 * time.Hour)
+		case oldestRangeAge.Before(now.Add(-30 * 24 * time.Hour)):
+			lruLastModifiedPruneCutoff = lruLastModifiedPruneCutoff.Add(3 * 24 * time.Hour)
+		default:
+			lruLastModifiedPruneCutoff = lruLastModifiedPruneCutoff.Add(24 * time.Hour)
+		}
+
+		util.Debug("CacheHandler: 尝试释放 %d 字节，当前扫描静态范围 %s", bytesToFree, pruneStaticRange)
+
+		staticRangeDir := filepath.Join(settings.GetCacheDir(), pruneStaticRange[0:2], pruneStaticRange[2:4])
 		entries, err := os.ReadDir(staticRangeDir)
 		if err != nil {
 			util.Warning("CacheHandler: 无法访问静态范围目录 %s", staticRangeDir)
-			// 更新时间戳以避免无限循环
-			ch.staticRangeOldest[pruneStaticRange] = time.Now().UnixNano()
+			ch.staticRangeOldest[pruneStaticRange] = lruLastModifiedPruneCutoff.UnixNano()
 		} else {
-			oldestTime := time.Now()
+			oldestLastModified := now.UnixNano()
+			util.Debug("CacheHandler: 检查 %d 个文件，修剪阈值=%d", len(entries), lruLastModifiedPruneCutoff.UnixNano())
 
 			for _, entry := range entries {
 				if entry.IsDir() {
 					continue
 				}
 
+				filePath := filepath.Join(staticRangeDir, entry.Name())
 				info, err := entry.Info()
 				if err != nil {
 					continue
 				}
 
-				fileID := entry.Name()
-				hvFile, err := hvfile.GetHVFileFromFileid(fileID)
-				if err == nil {
+				lastModified := info.ModTime().UnixNano()
+				if lastModified < lruLastModifiedPruneCutoff.UnixNano() {
+					hvFile, err := hvfile.GetHVFileFromFileid(entry.Name())
+					if err != nil {
+						util.Warning("CacheHandler: 删除无效缓存文件 %s", filePath)
+						_ = os.Remove(filePath)
+						continue
+					}
+
 					ch.DeleteFileFromCache(hvFile)
 					bytesToFree -= int64(hvFile.GetSize())
-				}
-
-				if info.ModTime().Before(oldestTime) {
-					oldestTime = info.ModTime()
+					util.Debug("CacheHandler: 已修剪文件 lastModified=%d size=%d bytesToFree=%d cacheCount=%d", lastModified, hvFile.GetSize(), bytesToFree, ch.cacheCount)
+				} else if lastModified < oldestLastModified {
+					oldestLastModified = lastModified
 				}
 			}
 
-			ch.staticRangeOldest[pruneStaticRange] = oldestTime.UnixNano()
+			ch.staticRangeOldest[pruneStaticRange] = oldestLastModified
+			util.Debug("CacheHandler: 静态范围 %s 的最旧时间已更新为 %d", pruneStaticRange, oldestLastModified)
+		}
+	} else {
+		if cacheLimit-cacheSizeWithOverhead > wantFree*10 {
+			ch.lruSkipCheckCycle = 60
+		} else {
+			ch.lruSkipCheckCycle = 6
 		}
 	}
 
-	ch.lruSkipCheckCycle = 60
-	ch.pruneAggression = 1
+	if bytesToFree > 10485760 {
+		ch.pruneAggression = int(bytesToFree / 10485760)
+	} else {
+		ch.pruneAggression = 1
+	}
 
 	if settings.IsSkipFreeSpaceCheck() {
+		util.Debug("CacheHandler: 已禁用磁盘剩余空间检查")
 		return true
 	}
 
+	diskFreeSpace, err := getDiskFreeSpace(settings.GetCacheDir())
+	if err != nil {
+		util.Warning("CacheHandler: 获取磁盘剩余空间失败: %v", err)
+		return false
+	}
+
+	minRequired := maxInt64(settings.GetDiskMinRemainingBytes(), wantFree)
+	if int64(diskFreeSpace) < minRequired {
+		util.Warning("CacheHandler: 未满足剩余空间约束，设备可用空间仅 %d 字节", diskFreeSpace)
+		return false
+	}
+
+	util.Debug("CacheHandler: 已满足磁盘剩余空间约束，可用空间 %d 字节", diskFreeSpace)
 	return true
 }
 
-// findOldestStaticRange 找到最旧的静态范围
 func (ch *CacheHandler) findOldestStaticRange() string {
 	var oldestRange string
-	var oldestTime int64 = time.Now().UnixNano()
-
+	oldestTime := time.Now().UnixNano()
 	for rangeName, rangeTime := range ch.staticRangeOldest {
 		if rangeTime < oldestTime {
 			oldestTime = rangeTime
 			oldestRange = rangeName
 		}
 	}
-
 	return oldestRange
 }
 
-// getCacheSizeWithOverhead 获取带开销的缓存大小
 func (ch *CacheHandler) getCacheSizeWithOverhead() int64 {
-	settings := config.GetSettings()
-	return ch.cacheSize + int64(ch.cacheCount)*settings.GetFileSystemBlockSize()/2
+	return ch.cacheSize + int64(ch.cacheCount)*config.GetSettings().GetFileSystemBlockSize()/2
 }
 
-// GetPruneAggression 获取修剪激进度
 func (ch *CacheHandler) GetPruneAggression() int {
 	return ch.pruneAggression
 }
 
-// ProcessBlacklist 处理黑名单
 func (ch *CacheHandler) ProcessBlacklist(deltaTime int64) {
 	util.Info("CacheHandler: 获取黑名单文件列表...")
 	blacklisted := ch.client.GetServerHandler().GetBlacklist(deltaTime)
-
 	if blacklisted == nil {
-		util.Warning("CacheHandler: 获取文件黑名单失败，稍后重试")
+		util.Warning("CacheHandler: 获取黑名单失败，稍后重试")
 		return
 	}
 
 	util.Info("CacheHandler: 查找并删除黑名单文件...")
-
 	counter := 0
 	for _, fileID := range blacklisted {
 		hvFile, err := hvfile.GetHVFileFromFileid(fileID)
@@ -375,8 +570,7 @@ func (ch *CacheHandler) ProcessBlacklist(deltaTime int64) {
 			continue
 		}
 
-		filePath := hvFile.GetLocalFileRef()
-		if _, err := os.Stat(filePath); err == nil {
+		if _, err := os.Stat(hvFile.GetLocalFileRef()); err == nil {
 			ch.DeleteFileFromCache(hvFile)
 			util.Debug("CacheHandler: 删除黑名单文件 %s", fileID)
 			counter++
@@ -386,48 +580,19 @@ func (ch *CacheHandler) ProcessBlacklist(deltaTime int64) {
 	util.Info("CacheHandler: 删除了 %d 个黑名单文件", counter)
 }
 
-// TerminateCache 终止缓存
 func (ch *CacheHandler) TerminateCache() {
 	_ = ch.savePersistentData()
 	ch.cacheLoaded = false
 }
 
-// importFileToCache 导入文件到缓存
 func (ch *CacheHandler) importFileToCache(tempFile string, hvFile *hvfile.HVFile) bool {
-	targetPath := hvFile.GetLocalFileRef()
-
-	// 创建目标目录
-	if err := os.MkdirAll(filepath.Dir(targetPath), 0755); err != nil {
-		util.Warning("无法创建目标目录: %v", err)
+	if !ch.moveFileToCacheDir(tempFile, hvFile) {
 		return false
-	}
-
-	// 移动文件
-	if err := os.Rename(tempFile, targetPath); err != nil {
-		// 如果重命名失败，尝试复制
-		src, err := os.Open(tempFile)
-		if err != nil {
-			return false
-		}
-		defer src.Close()
-
-		dst, err := os.Create(targetPath)
-		if err != nil {
-			return false
-		}
-		defer dst.Close()
-
-		if _, err := io.Copy(dst, src); err != nil {
-			return false
-		}
-
-		os.Remove(tempFile)
 	}
 
 	ch.addFileToActiveCache(hvFile)
 	ch.markRecentlyAccessed(hvFile, true)
 
-	// 检查静态范围最旧时间戳缓存
 	staticRange := hvFile.GetStaticRange()
 	if _, ok := ch.staticRangeOldest[staticRange]; !ok {
 		util.Debug("CacheHandler: 为 %s 创建 staticRangeOldest 条目", staticRange)
@@ -437,29 +602,61 @@ func (ch *CacheHandler) importFileToCache(tempFile string, hvFile *hvfile.HVFile
 	return true
 }
 
-// ImportFileToCache 导入文件到缓存（导出接口）
 func (ch *CacheHandler) ImportFileToCache(tempFile string, hvFile *hvfile.HVFile) bool {
 	return ch.importFileToCache(tempFile, hvFile)
 }
 
-// getFileSHA1 获取文件 SHA-1
-func getFileSHA1(filePath string) (string, error) {
-	file, err := os.Open(filePath)
+func (ch *CacheHandler) moveFileToCacheDir(sourcePath string, hvFile *hvfile.HVFile) bool {
+	targetPath := hvFile.GetLocalFileRef()
+	if err := os.MkdirAll(filepath.Dir(targetPath), 0755); err != nil {
+		util.Warning("CacheHandler: 无法创建目标目录: %v", err)
+		return false
+	}
+
+	_ = os.Remove(targetPath)
+	if err := os.Rename(sourcePath, targetPath); err == nil {
+		if _, err := os.Stat(targetPath); err == nil {
+			return true
+		}
+	}
+
+	src, err := os.Open(sourcePath)
 	if err != nil {
-		return "", err
+		return false
 	}
-	defer file.Close()
+	defer src.Close()
 
-	hasher := sha1.New()
-	if _, err := io.Copy(hasher, file); err != nil {
-		return "", err
+	dst, err := os.Create(targetPath)
+	if err != nil {
+		return false
+	}
+	defer dst.Close()
+
+	if _, err := io.Copy(dst, src); err != nil {
+		return false
 	}
 
-	return strings.ToLower(hex.EncodeToString(hasher.Sum(nil))), nil
+	_ = os.Remove(sourcePath)
+	_, err = os.Stat(targetPath)
+	return err == nil
 }
 
 func minInt(a, b int) int {
 	if a < b {
+		return a
+	}
+	return b
+}
+
+func maxInt64(a, b int64) int64 {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func max(a, b int) int {
+	if a > b {
 		return a
 	}
 	return b
