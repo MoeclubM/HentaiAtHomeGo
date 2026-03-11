@@ -172,17 +172,22 @@ func (o *Out) RemoveListener(listener OutListener) {
 // DisableLogging 禁用日志
 func (o *Out) DisableLogging() {
 	o.mu.Lock()
-	defer o.mu.Unlock()
-
-	if o.writeLogs {
-		Info("Logging ended.") // 使用全局函数而不是方法
-		o.writeLogs = false
-		o.FlushLogs()
-
-		if o.logoutFile != nil {
-			_ = o.stopLogger(&o.logoutFile)
-		}
+	if !o.writeLogs {
+		o.mu.Unlock()
+		return
 	}
+
+	o.writeLogs = false
+	logoutFile := o.logoutFile
+	o.logoutFile = nil
+	o.mu.Unlock()
+
+	if logoutFile != nil {
+		_ = logoutFile.Sync()
+		_ = logoutFile.Close()
+	}
+
+	Info("Logging ended.")
 }
 
 // FlushLogs 刷新日志缓冲区
@@ -286,26 +291,39 @@ func (o *Out) log(severity int, level, format string, args ...interface{}) {
 				o.logerrCount++
 				if o.logerrCount > 10000 {
 					o.logerrCount = 0
-					Info("Rotating error logfile...")
-					_ = o.stopLogger(&o.logerrFile)
-					_ = o.startLogger(&o.logerrFile, o.logerrPath, false)
-					Info("Error logfile rotated.")
+					o.rotateLoggerLocked(&o.logerrFile, o.logerrPath, false)
 				}
 			} else if o.writeLogs && o.logoutFile != nil {
 				o.logToFile(o.logoutFile, data, false)
 				o.logoutCount++
 				if o.logoutCount > 100000 {
 					o.logoutCount = 0
-					Info("Rotating output logfile...")
-					_ = o.stopLogger(&o.logoutFile)
-					_ = o.startLogger(&o.logoutFile, o.logoutPath, false)
-					Info("Output logfile rotated.")
+					o.rotateLoggerLocked(&o.logoutFile, o.logoutPath, false)
 				}
 			}
 		}
 
 		o.mu.Unlock()
 	}
+}
+
+func (o *Out) rotateLoggerLocked(file **os.File, path string, writeHeader bool) {
+	if err := o.stopLogger(file); err != nil {
+		o.writeDirectError(err)
+		return
+	}
+	if err := o.startLogger(file, path, writeHeader); err != nil {
+		o.writeDirectError(err)
+	}
+}
+
+func (o *Out) writeDirectError(err error) {
+	if err == nil {
+		return
+	}
+
+	timestamp := time.Now().UTC().Format("2006-01-02T15:04:05Z")
+	_, _ = fmt.Fprintln(o.defErr, fmt.Sprintf("%s [ERROR] %s", timestamp, err.Error()))
 }
 
 // logToFile 写入日志文件
