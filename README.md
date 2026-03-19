@@ -2,9 +2,9 @@
 
 `HentaiAtHomeGo` 是 `Hentai@Home 1.6.4` 的 Go 实现，目标是与现有管理端和 CDN 工作流保持兼容。
 
-- 本地只配置 `Client ID`、`Client Key` 和各类数据目录
-- 端口、主机、带宽、连接数等运行参数由管理端远程下发
-- `HentaiAtHome_1.6.4_src/` 仅保留为 Java 参考源码
+- 配置 `Client ID`、`Client Key` 和各类数据目录即可运行
+- 与原版客户端功能一致，但是本地文件不互相兼容，如果更换需要重置缓存
+
 
 ## 快速开始
 
